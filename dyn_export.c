@@ -8,6 +8,8 @@
 #include <linux/sysfs.h>
 
 #include <linux/device.h>
+#include <linux/list.h>
+#include <linux/mutex.h>
 
 #define DEVICE_NAME "dyn_exportdev"
 #define CLASS_NAME "dyn_export"
@@ -22,8 +24,11 @@ MODULE_LICENSE("GPL");
 #define warn(format, arg...) pr_warn(CLASS_NAME ": " format "\n", ## arg)
 #define err(format, arg...) pr_err(CLASS_NAME ": " format "\n", ## arg)
 
+static LIST_HEAD(dev_list);
+static DEFINE_MUTEX(sysfs_lock);
 
 struct dyn_export_data {
+    struct list_head list;
     int number;
     int thing1;
     int thing2;
@@ -43,6 +48,9 @@ static ssize_t export_store(struct class *class,
 static ssize_t unexport_store(struct class *class,
                             struct class_attribute *attr,
                             const char *buf, size_t len);
+
+static struct dyn_export_data * dyn_alloc(long number);
+static ssize_t dyn_free(long number);
 
 static struct class_attribute dyn_export_class_attrs[] = {
     __ATTR_WO(export),
@@ -87,7 +95,7 @@ static ssize_t thing2_show(struct device *dev,
                          struct device_attribute *attr, char *buf)
 {
     struct dyn_export_data *data = dev_get_drvdata(dev);
-    return scnprintf(buf, PAGE_SIZE, "%d", data->thing1);
+    return scnprintf(buf, PAGE_SIZE, "%d", data->thing2);
 }
 
 static ssize_t thing2_store(struct device *dev,
@@ -134,11 +142,73 @@ static ssize_t export_store(struct class *class,
     int status;
     struct device *dev;
 
+    mutex_lock(&sysfs_lock);
     status = kstrtol(buf, 0, &number);
     if (status < 0) {
         err("could not parse input as a long, status=%d", status);
         goto err_parse_input;
     }
+
+    data = dyn_alloc(number);
+    if (!data) {
+        goto err_alloc_data;
+    }
+
+    dev = device_create_with_groups(&dyn_export_class, NULL,
+                                    MKDEV(0,0), data, dyn_groups,
+                                    "dyn%ld", number);
+    if (IS_ERR(dev)) {
+        err("Could not create device for dyn%ld", number);
+        status = PTR_ERR(dev);
+        goto err_dev_create;
+    }
+
+    list_add(&data->list, &dev_list);
+
+    mutex_unlock(&sysfs_lock);
+
+    return len;
+
+err_dev_create:
+    kfree(data);
+err_alloc_data:
+err_parse_input:
+    mutex_unlock(&sysfs_lock);
+    return status;
+}
+
+static ssize_t unexport_store(struct class *class,
+                            struct class_attribute *attr,
+                            const char *buf, size_t len)
+{
+    long number;
+    int status;
+
+    mutex_lock(&sysfs_lock);
+    status = kstrtol(buf, 0, &number);
+    if (status < 0) {
+        err("could not parse input as a long, status=%d", status);
+        goto err_parse_input;
+    }
+
+    status = dyn_free(number);
+    if (status < 0) {
+        goto err_dyn_free_error;
+    }
+
+    mutex_unlock(&sysfs_lock);
+    return len;
+
+err_dyn_free_error:
+err_parse_input:
+    mutex_unlock(&sysfs_lock);
+    return status;
+}
+
+static struct dyn_export_data * dyn_alloc(long number)
+{
+    struct dyn_export_data *data;
+    int status;
 
     data = kzalloc(sizeof(struct dyn_export_data), GFP_KERNEL);
     if (!data) {
@@ -149,39 +219,17 @@ static ssize_t export_store(struct class *class,
 
     data->number = number;
     data->thing1 = data->thing2 = 0;
-    err("starting create with groups");
-    dev = device_create_with_groups(&dyn_export_class, NULL,
-                                    MKDEV(0,0), data, dyn_groups,
-                                    "dyn%ld", number);
-    err("done create with groups");
-    if (IS_ERR(dev)) {
-        err("Could not create device for dyn%ld", number);
-        status = PTR_ERR(dev);
-        goto err_dev_create;
-    }
-    return len;
+    return data;
 
-err_dev_create:
-    kfree(data);
 err_alloc_data:
-err_parse_input:
-    return status;
+    return NULL;
 }
 
-static ssize_t unexport_store(struct class *class,
-                            struct class_attribute *attr,
-                            const char *buf, size_t len)
+static ssize_t dyn_free(long number)
 {
-    long number;
     int status;
     struct gpiod_data *data;
     struct device *dev;
-
-    status = kstrtol(buf, 0, &number);
-    if (status < 0) {
-        err("could not parse input as a long, status=%d", status);
-        goto err_parse_input;
-    }
 
     dev = class_find_device(&dyn_export_class, NULL, (const void *)number, match_export);
     if (!dev) {
@@ -195,18 +243,13 @@ static ssize_t unexport_store(struct class *class,
     device_unregister(dev);
     put_device(dev);
     kfree(data);
-
-    return len;
+    return 0;
 
 err_not_exported:
-err_parse_input:
     return status;
 }
 
 
-static struct file_operations fops = {};
-
-/* Module initialization and release */
 static int __init dyn_export_module_init(void)
 {
     int retval;
@@ -222,7 +265,12 @@ static int __init dyn_export_module_init(void)
 
 static void __exit dyn_export_module_exit(void)
 {
-    class_unregister(&dyn_export_class);
+    struct list_head *item;
+    struct dyn_export_data *data;
+    list_for_each(item, &dev_list) {
+        data = list_entry(item, struct dyn_export_data, list);
+        dyn_free(data->number);
+    }
     class_destroy(&dyn_export_class);
 }
 
