@@ -228,7 +228,7 @@ err_alloc_data:
 static ssize_t dyn_free(long number)
 {
     int status;
-    struct gpiod_data *data;
+    struct dyn_export_data *data;
     struct device *dev;
 
     dev = class_find_device(&dyn_export_class, NULL, (const void *)number, match_export);
